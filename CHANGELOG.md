@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.0.1] - 2026-09-01
+
+### 🛠️ Smart Package Classification & State-Machine Metadata Parser
+
+* **Executable & Service Whitelist Filter:** Automatically excludes any package that installs an executable command in `/opt/bin/`, `/opt/sbin/`, or a service in `/opt/etc/init.d/`, protecting user-installed tools (`htop`, `micro`, `ripgrep`, `tailscale`, etc.).
+* **State-Machine AWK Parser:** Line-by-line parser for `/opt/lib/opkg/status` ensuring 100% portable metadata and dependency extraction across BusyBox ash and standard awk.
+* **CDN Cache Busting:** Added `?nocache` query timestamp to universal installer downloads preventing stale CDN caching.
+* **Refined Dynamic Linker Check:** Gracefully handles standard system runtime paths when `/opt/etc/ld.so.conf` is empty.
+
+---
+
 ## [1.0.0] - 2026-09-01
 
 ### 🚀 Initial Production Release

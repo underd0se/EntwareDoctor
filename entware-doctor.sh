@@ -10,7 +10,7 @@ set -eu
 # Ensure standard Entware and system PATH
 export PATH="/opt/bin:/opt/sbin:/usr/bin:/usr/sbin:/bin:/sbin:${PATH:-}"
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 OPKG_STATUS="/opt/lib/opkg/status"
 
 # Colors
@@ -268,16 +268,16 @@ check_services_and_locks() {
 check_linker_and_paths() {
     log_step "5/7" "Verifying Dynamic Linker & Environment Path"
 
-    # Check ld.so.conf if present
-    if [ -f "/opt/etc/ld.so.conf" ]; then
-        if ! grep -qE "^[[:space:]]*/opt/lib" /opt/etc/ld.so.conf 2>/dev/null; then
+    # Check ld.so.conf if present and has content
+    if [ -s "/opt/etc/ld.so.conf" ]; then
+        if grep -qE "(^|/opt/)lib" /opt/etc/ld.so.conf 2>/dev/null; then
+            log_ok "ld.so.conf configured correctly - OK"
+        else
             log_warn "/opt/etc/ld.so.conf does not include /opt/lib"
             if [ "${FLAG_FIX}" -eq 1 ]; then
                 echo "/opt/lib" >> /opt/etc/ld.so.conf
                 log_fix "Added /opt/lib to /opt/etc/ld.so.conf"
             fi
-        else
-            log_ok "ld.so.conf contains /opt/lib - OK"
         fi
     else
         log_ok "Dynamic linker uses standard Entware runtime paths - OK"
@@ -290,6 +290,8 @@ check_linker_and_paths() {
         else
             log_ok "JFFS profile environment includes /opt - OK"
         fi
+    else
+        log_ok "System environment PATH includes /opt - OK"
     fi
 }
 
@@ -304,47 +306,57 @@ check_orphaned_packages() {
         return 0
     fi
 
-    # 1. Parse all package metadata in a single AWK pass
+    # 1. Line-by-line AWK state machine for 100% portable metadata extraction
     pkg_meta_tmp="/tmp/entware_doctor_pkgs_$$.tmp"
 
     awk '
-    BEGIN { RS=""; FS="\n" }
-    {
-        pkg=""; sec=""; size=0; deps="";
-        for (i=1; i<=NF; i++) {
-            if ($i ~ /^Package: /) {
-                sub(/^Package: /, "", $i);
-                pkg = $i;
-            } else if ($i ~ /^Section: /) {
-                sub(/^Section: /, "", $i);
-                sec = $i;
-            } else if ($i ~ /^Installed-Size: /) {
-                sub(/^Installed-Size: /, "", $i);
-                size = $i;
-            } else if ($i ~ /^Depends: /) {
-                sub(/^Depends: /, "", $i);
-                split($i, raw_deps, ",");
-                clean_deps = "";
-                for (d in raw_deps) {
-                    gsub(/\([^)]*\)/, "", raw_deps[d]);
-                    gsub(/[ \t]/, "", raw_deps[d]);
-                    if (raw_deps[d] != "") {
-                        clean_deps = clean_deps " " raw_deps[d];
-                    }
-                }
-                deps = clean_deps;
+    /^Package: / {
+        if (pkg != "") {
+            print pkg "|" sec "|" size "|" deps;
+        }
+        pkg = substr($0, 10);
+        gsub(/[ \t\r\n]/, "", pkg);
+        sec = "";
+        size = 0;
+        deps = "";
+        next;
+    }
+    /^Section: / {
+        sec = substr($0, 10);
+        gsub(/[ \t\r\n]/, "", sec);
+        next;
+    }
+    /^Installed-Size: / {
+        size = substr($0, 17);
+        gsub(/[ \t\r\n]/, "", size);
+        next;
+    }
+    /^Depends: / {
+        dline = substr($0, 10);
+        split(dline, raw_deps, ",");
+        clean_deps = "";
+        for (d in raw_deps) {
+            dep = raw_deps[d];
+            gsub(/\([^)]*\)/, "", dep);
+            gsub(/[ \t\r\n]/, "", dep);
+            if (dep != "") {
+                clean_deps = clean_deps " " dep;
             }
         }
+        deps = clean_deps;
+        next;
+    }
+    END {
         if (pkg != "") {
             print pkg "|" sec "|" size "|" deps;
         }
     }
     ' "${OPKG_STATUS}" > "${pkg_meta_tmp}"
 
-    # 2. Build the master list of all required dependency package names
+    # 2. Build master list of required dependencies
     all_needed_deps="$(awk -F'|' '{print $4}' "${pkg_meta_tmp}" | tr ' ' '\n' | grep -v '^$' | sort -u)"
 
-    # 3. Collect list of all ELF libraries currently referenced by installed binaries in /opt/bin and /opt/sbin
+    # 3. Collect active dynamic libraries linked by executables in /opt/bin and /opt/sbin
     used_so_files=""
     if command -v ldd >/dev/null 2>&1; then
         used_so_files="$(ldd /opt/bin/* /opt/sbin/* 2>/dev/null | awk '{print $1}' | sed 's/.*lib/lib/' | sort -u || true)"
@@ -362,18 +374,23 @@ check_orphaned_packages() {
             *" ${pkg_name} "*) continue ;;
         esac
 
-        # Check if the package is a standalone user executable / daemon
-        # If /opt/lib/opkg/info/${pkg_name}.list contains files in /opt/bin/, /opt/sbin/, or /opt/etc/init.d/,
-        # it is a user application or system service, NEVER an orphan!
+        # Locate package file manifest
         pkg_list_file="/opt/lib/opkg/info/${pkg_name}.list"
+        [ -f "${pkg_list_file}" ] || pkg_list_file="/opt/var/lib/opkg/info/${pkg_name}.list"
+
+        # Check if the package installs any executable command or init script
         if [ -f "${pkg_list_file}" ]; then
-            if grep -qE "^/opt/(bin|sbin|etc/init\.d)/" "${pkg_list_file}" 2>/dev/null; then
+            if grep -qE "(^|/)(bin|sbin|etc/init\.d)/" "${pkg_list_file}" 2>/dev/null; then
                 continue
             fi
         fi
 
+        # Direct executable verification in /opt/bin and /opt/sbin
+        if [ -x "/opt/bin/${pkg_name}" ] || [ -x "/opt/sbin/${pkg_name}" ]; then
+            continue
+        fi
+
         # Check if package is a library or support package
-        # (Section is libs, or name starts with lib, python3-, perl-, lua-, *-data, *-common)
         is_lib_pkg=0
         case "${pkg_sec}" in
             *lib*) is_lib_pkg=1 ;;
@@ -382,15 +399,15 @@ check_orphaned_packages() {
             lib*|python3-*|perl5-*|lua-*|*-data|*-common) is_lib_pkg=1 ;;
         esac
 
-        # If it is not a library/support package, it is a standalone user package -> skip
+        # Standalone application -> skip
         [ "${is_lib_pkg}" -eq 0 ] && continue
 
-        # Check if any other installed package depends on this library
+        # Check if required as a dependency by another installed package
         if echo "${all_needed_deps}" | grep -qx "${pkg_name}"; then
             continue
         fi
 
-        # Check if any binary dynamically references .so files owned by this package
+        # Check if dynamically linked by active binaries in /opt/bin or /opt/sbin
         if [ -n "${used_so_files}" ] && [ -f "${pkg_list_file}" ]; then
             pkg_so_names="$(grep '\.so' "${pkg_list_file}" 2>/dev/null | awk -F'/' '{print $NF}' | sed 's/\.so.*/.so/' || true)"
             is_so_used=0
@@ -403,7 +420,7 @@ check_orphaned_packages() {
             [ "${is_so_used}" -eq 1 ] && continue
         fi
 
-        # This is a true orphan!
+        # True Orphan!
         orphan_candidates="${orphan_candidates} ${pkg_name}"
         reclaimed_bytes=$((reclaimed_bytes + pkg_size))
 
@@ -428,6 +445,7 @@ check_orphaned_packages() {
                     printf "    [*] Removing %s...\n" "${opkg_name}"
                     opkg remove "${opkg_name}" || true
                 done
+                TOTAL_RECLAIMED_KB=$((TOTAL_RECLAIMED_KB + reclaimed_kb))
                 log_fix "Purged ${orphan_count} orphaned packages."
             fi
         fi
