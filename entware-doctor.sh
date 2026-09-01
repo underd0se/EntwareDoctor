@@ -38,7 +38,7 @@ FLAG_ASSUME_YES=0
 FLAG_DRY_RUN=0
 TOTAL_ISSUES=0
 FIXED_ISSUES=0
-RECLAIMED_KB=0
+TOTAL_RECLAIMED_KB=0
 
 # Core protected package whitelist (never treat as orphans)
 PROTECTED_PKGS="opkg entware-opt busybox libc libpthread librt libgcc libstdcpp musl ca-certificates"
@@ -268,9 +268,9 @@ check_services_and_locks() {
 check_linker_and_paths() {
     log_step "5/7" "Verifying Dynamic Linker & Environment Path"
 
-    # Check ld.so.conf
+    # Check ld.so.conf if present
     if [ -f "/opt/etc/ld.so.conf" ]; then
-        if ! grep -q "/opt/lib" /opt/etc/ld.so.conf 2>/dev/null; then
+        if ! grep -qE "^[[:space:]]*/opt/lib" /opt/etc/ld.so.conf 2>/dev/null; then
             log_warn "/opt/etc/ld.so.conf does not include /opt/lib"
             if [ "${FLAG_FIX}" -eq 1 ]; then
                 echo "/opt/lib" >> /opt/etc/ld.so.conf
@@ -279,6 +279,8 @@ check_linker_and_paths() {
         else
             log_ok "ld.so.conf contains /opt/lib - OK"
         fi
+    else
+        log_ok "Dynamic linker uses standard Entware runtime paths - OK"
     fi
 
     # Check PATH in profile.add
@@ -295,55 +297,133 @@ check_linker_and_paths() {
 # Step 6: Orphaned Package Detection & Removal Engine
 
 check_orphaned_packages() {
-    log_step "6/7" "Scanning for Orphaned Packages (Dependency Graph Analysis)"
+    log_step "6/7" "Scanning for Orphaned Library Packages"
 
     if [ ! -f "${OPKG_STATUS}" ]; then
         log_warn "opkg status database not found at ${OPKG_STATUS}."
         return 0
     fi
 
-    # 1. Collect all installed packages
-    installed_pkgs="$(awk -F': ' '/^Package: / {print $2}' "${OPKG_STATUS}" | sort -u)"
-    
-    # 2. Collect all required dependencies across all installed packages
-    required_deps="$(awk -F': ' '/^Depends: / {print $2}' "${OPKG_STATUS}" | tr ',' '\n' | awk '{print $1}' | sort -u)"
+    # 1. Parse all package metadata in a single AWK pass
+    pkg_meta_tmp="/tmp/entware_doctor_pkgs_$$.tmp"
 
-    # 3. Find candidates with 0 reverse dependencies
+    awk '
+    BEGIN { RS=""; FS="\n" }
+    {
+        pkg=""; sec=""; size=0; deps="";
+        for (i=1; i<=NF; i++) {
+            if ($i ~ /^Package: /) {
+                sub(/^Package: /, "", $i);
+                pkg = $i;
+            } else if ($i ~ /^Section: /) {
+                sub(/^Section: /, "", $i);
+                sec = $i;
+            } else if ($i ~ /^Installed-Size: /) {
+                sub(/^Installed-Size: /, "", $i);
+                size = $i;
+            } else if ($i ~ /^Depends: /) {
+                sub(/^Depends: /, "", $i);
+                split($i, raw_deps, ",");
+                clean_deps = "";
+                for (d in raw_deps) {
+                    gsub(/\([^)]*\)/, "", raw_deps[d]);
+                    gsub(/[ \t]/, "", raw_deps[d]);
+                    if (raw_deps[d] != "") {
+                        clean_deps = clean_deps " " raw_deps[d];
+                    }
+                }
+                deps = clean_deps;
+            }
+        }
+        if (pkg != "") {
+            print pkg "|" sec "|" size "|" deps;
+        }
+    }
+    ' "${OPKG_STATUS}" > "${pkg_meta_tmp}"
+
+    # 2. Build the master list of all required dependency package names
+    all_needed_deps="$(awk -F'|' '{print $4}' "${pkg_meta_tmp}" | tr ' ' '\n' | grep -v '^$' | sort -u)"
+
+    # 3. Collect list of all ELF libraries currently referenced by installed binaries in /opt/bin and /opt/sbin
+    used_so_files=""
+    if command -v ldd >/dev/null 2>&1; then
+        used_so_files="$(ldd /opt/bin/* /opt/sbin/* 2>/dev/null | awk '{print $1}' | sed 's/.*lib/lib/' | sort -u || true)"
+    fi
+
     orphan_candidates=""
-    for pkg in ${installed_pkgs}; do
-        # Skip protected core packages
-        is_protected=0
-        for prot in ${PROTECTED_PKGS}; do
-            if [ "${pkg}" = "${prot}" ]; then
-                is_protected=1
-                break
-            fi
-        done
-        [ "${is_protected}" -eq 1 ] && continue
+    reclaimed_bytes=0
 
-        # Check if any other installed package depends on this package
-        if ! echo "${required_deps}" | grep -qx "${pkg}"; then
-            pkg_size_kb="$(grep -A 10 "^Package: ${pkg}$" "${OPKG_STATUS}" | grep "^Installed-Size: " | awk '{print $2}' || echo "0")"
-            orphan_candidates="${orphan_candidates} ${pkg}"
-            if [ -n "${pkg_size_kb}" ]; then
-                RECLAIMED_KB=$((RECLAIMED_KB + pkg_size_kb))
+    # 4. Evaluate each installed package
+    while IFS='|' read -r pkg_name pkg_sec pkg_size _pkg_deps; do
+        [ -n "${pkg_name}" ] || continue
+
+        # Skip protected packages
+        case " ${PROTECTED_PKGS} " in
+            *" ${pkg_name} "*) continue ;;
+        esac
+
+        # Check if the package is a standalone user executable / daemon
+        # If /opt/lib/opkg/info/${pkg_name}.list contains files in /opt/bin/, /opt/sbin/, or /opt/etc/init.d/,
+        # it is a user application or system service, NEVER an orphan!
+        pkg_list_file="/opt/lib/opkg/info/${pkg_name}.list"
+        if [ -f "${pkg_list_file}" ]; then
+            if grep -qE "^/opt/(bin|sbin|etc/init\.d)/" "${pkg_list_file}" 2>/dev/null; then
+                continue
             fi
         fi
-    done
 
-    # Trim whitespace
+        # Check if package is a library or support package
+        # (Section is libs, or name starts with lib, python3-, perl-, lua-, *-data, *-common)
+        is_lib_pkg=0
+        case "${pkg_sec}" in
+            *lib*) is_lib_pkg=1 ;;
+        esac
+        case "${pkg_name}" in
+            lib*|python3-*|perl5-*|lua-*|*-data|*-common) is_lib_pkg=1 ;;
+        esac
+
+        # If it is not a library/support package, it is a standalone user package -> skip
+        [ "${is_lib_pkg}" -eq 0 ] && continue
+
+        # Check if any other installed package depends on this library
+        if echo "${all_needed_deps}" | grep -qx "${pkg_name}"; then
+            continue
+        fi
+
+        # Check if any binary dynamically references .so files owned by this package
+        if [ -n "${used_so_files}" ] && [ -f "${pkg_list_file}" ]; then
+            pkg_so_names="$(grep '\.so' "${pkg_list_file}" 2>/dev/null | awk -F'/' '{print $NF}' | sed 's/\.so.*/.so/' || true)"
+            is_so_used=0
+            for so_name in ${pkg_so_names}; do
+                if echo "${used_so_files}" | grep -q "${so_name}"; then
+                    is_so_used=1
+                    break
+                fi
+            done
+            [ "${is_so_used}" -eq 1 ] && continue
+        fi
+
+        # This is a true orphan!
+        orphan_candidates="${orphan_candidates} ${pkg_name}"
+        reclaimed_bytes=$((reclaimed_bytes + pkg_size))
+
+    done < "${pkg_meta_tmp}"
+
+    rm -f "${pkg_meta_tmp}"
+
     orphan_candidates="$(echo "${orphan_candidates}" | sed 's/^[[:space:]]*//')"
 
     if [ -n "${orphan_candidates}" ]; then
         orphan_count="$(echo "${orphan_candidates}" | wc -w | tr -d ' ')"
-        log_warn "Detected ${orphan_count} unneeded / leaf packages:"
+        reclaimed_kb=$((reclaimed_bytes / 1024))
+        log_warn "Detected ${orphan_count} true orphaned library package(s):"
         for opkg_name in ${orphan_candidates}; do
             printf "        - %b%s%b\n" "${C_YELLOW}" "${opkg_name}" "${C_RESET}"
         done
-        printf "    %bRecoverable Space: ~%d KB%b\n" "${C_CYAN}" "${RECLAIMED_KB}" "${C_RESET}"
+        printf "    %bRecoverable Space: ~%d KB (%d MB)%b\n" "${C_CYAN}" "${reclaimed_kb}" "$((reclaimed_kb / 1024))" "${C_RESET}"
 
         if [ "${FLAG_FIX}" -eq 1 ] || [ "${FLAG_ASSUME_YES}" -eq 1 ]; then
-            if prompt_confirm "Would you like to remove these ${orphan_count} orphaned packages?"; then
+            if prompt_confirm "Would you like to remove these ${orphan_count} orphaned library packages?"; then
                 for opkg_name in ${orphan_candidates}; do
                     printf "    [*] Removing %s...\n" "${opkg_name}"
                     opkg remove "${opkg_name}" || true
@@ -352,7 +432,7 @@ check_orphaned_packages() {
             fi
         fi
     else
-        log_ok "No orphaned packages detected - Dependency graph is clean - OK"
+        log_ok "No orphaned library packages detected - All installed libraries are in active use - OK"
     fi
 }
 
@@ -376,6 +456,7 @@ check_ghost_files() {
         if [ "${FLAG_FIX}" -eq 1 ]; then
             if prompt_confirm "Remove stale backup file ${stale_conf}?"; then
                 rm -f "${stale_conf}"
+                TOTAL_RECLAIMED_KB=$((TOTAL_RECLAIMED_KB + (file_size / 1024)))
                 log_fix "Removed ${stale_conf}"
             fi
         fi
@@ -498,6 +579,9 @@ main() {
         printf "%b  Diagnosis Complete: Your Entware environment is 100%% HEALTHY!%b\n" "${C_GREEN}" "${C_RESET}"
     else
         printf "%b  Diagnosis Complete: %d issue(s) detected. %d issue(s) repaired.%b\n" "${C_YELLOW}" "${TOTAL_ISSUES}" "${FIXED_ISSUES}" "${C_RESET}"
+        if [ "${TOTAL_RECLAIMED_KB}" -gt 0 ]; then
+            printf "%b  Total Disk Space Reclaimed: ~%d KB (%d MB)%b\n" "${C_GREEN}" "${TOTAL_RECLAIMED_KB}" "$((TOTAL_RECLAIMED_KB / 1024))" "${C_RESET}"
+        fi
         if [ "${FLAG_FIX}" -eq 0 ]; then
             printf "%b  Tip: Run 'entware-doctor --fix' to automatically resolve these issues.%b\n" "${C_CYAN}" "${C_RESET}"
         fi
