@@ -12,7 +12,6 @@ export PATH="/opt/bin:/opt/sbin:/usr/bin:/usr/sbin:/bin:/sbin:${PATH:-}"
 
 VERSION="1.0.0"
 OPKG_STATUS="/opt/lib/opkg/status"
-OPKG_INFO_DIR="/opt/lib/opkg/info"
 
 # Colors
 if [ -t 1 ]; then
@@ -48,10 +47,10 @@ PROTECTED_PKGS="opkg entware-opt busybox libc libpthread librt libgcc libstdcpp 
 # Helper Functions
 
 log_header() {
-    printf "\n%b%s%b\n" "${C_GREEN}" "==================================================================="
-    printf "%b   EntwareDoctor v%s%b\n" "${C_BOLD}" "${VERSION}"
+    printf "\n%b%s%b\n" "${C_GREEN}" "===================================================================" "${C_RESET}"
+    printf "%b   EntwareDoctor v%s%b\n" "${C_BOLD}" "${VERSION}" "${C_RESET}"
     printf "%b   Automated Entware Health, Dependency & Cleanup Sentinel%b\n" "${C_DIM}" "${C_RESET}"
-    printf "%b%s%b\n\n" "${C_GREEN}" "==================================================================="
+    printf "%b%s%b\n\n" "${C_GREEN}" "===================================================================" "${C_RESET}"
 }
 
 log_step() {
@@ -324,8 +323,6 @@ check_orphaned_packages() {
 
         # Check if any other installed package depends on this package
         if ! echo "${required_deps}" | grep -qx "${pkg}"; then
-            # Check if package was auto-installed or is an unneeded leaf
-            pkg_installed_time="$(grep -A 10 "^Package: ${pkg}$" "${OPKG_STATUS}" | grep "^Installed-Time: " | awk '{print $2}')"
             pkg_size_kb="$(grep -A 10 "^Package: ${pkg}$" "${OPKG_STATUS}" | grep "^Installed-Size: " | awk '{print $2}' || echo "0")"
             orphan_candidates="${orphan_candidates} ${pkg}"
             if [ -n "${pkg_size_kb}" ]; then
