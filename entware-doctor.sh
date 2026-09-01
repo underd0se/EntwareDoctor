@@ -10,7 +10,7 @@ set -eu
 # Ensure standard Entware and system PATH
 export PATH="/opt/bin:/opt/sbin:/usr/bin:/usr/sbin:/bin:/sbin:${PATH:-}"
 
-VERSION="1.0.1"
+VERSION="1.0.2"
 OPKG_STATUS="/opt/lib/opkg/status"
 
 # Colors
@@ -363,8 +363,8 @@ check_orphaned_packages() {
     all_needed_deps="$(awk -F'|' '{print $4}' "${pkg_meta_tmp}" | tr ' ' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' | sort -u)"
 
     # 3. Discover all dynamic shared libraries (.so) actively referenced by all binaries in /opt
-    # This works natively with BusyBox grep without needing ldd or readelf!
-    used_so_files="$(grep -ahoE 'lib[a-zA-Z0-9_\.\+-]+\.so(\.[0-9]+)*' /opt/bin /opt/sbin /opt/lib 2>/dev/null | sort -u || true)"
+    # Uses both glob expansion and recursive scan so it works 100% on all BusyBox builds
+    used_so_files="$( (grep -ahoE 'lib[a-zA-Z0-9_\.\+-]+\.so(\.[0-9]+)*' /opt/bin/* /opt/sbin/* /opt/lib/* 2>/dev/null || grep -rahoE 'lib[a-zA-Z0-9_\.\+-]+\.so(\.[0-9]+)*' /opt/bin /opt/sbin /opt/lib 2>/dev/null) | sort -u || true)"
 
     orphan_candidates=""
     reclaimed_bytes=0

@@ -10,7 +10,7 @@ set -e
 export PATH="/opt/bin:/opt/sbin:/usr/bin:/usr/sbin:/bin:/sbin:${PATH:-}"
 
 REPO_RAW_URL="https://raw.githubusercontent.com/underd0se/EntwareDoctor/main"
-VERSION="v1.0.1"
+VERSION="v1.0.2"
 INSTALL_DIR="/jffs/scripts"
 TARGET_SCRIPT="${INSTALL_DIR}/entware-doctor"
 

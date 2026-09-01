@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.0.2] - 2026-09-01
+
+### 🛠️ Enhanced Binary Scan with Glob & Recursive Matching
+
+* **Glob & Recursive SO Scanner:** Fixed binary directory inspection by supporting both glob expansion (`/opt/bin/*`, `/opt/sbin/*`) and recursive `-r` scanning, correctly resolving all dynamically loaded shared libraries.
+* **Exact Size Accumulator:** Enhanced `Installed-Size` numeric extraction and human-readable KB/MB space calculations.
+
+---
+
 ## [1.0.1] - 2026-09-01
 
 ### 🛠️ Smart Package Classification & State-Machine Metadata Parser
