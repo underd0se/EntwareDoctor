@@ -306,44 +306,50 @@ check_orphaned_packages() {
         return 0
     fi
 
-    # 1. Line-by-line AWK state machine for 100% portable metadata extraction
+    # 1. Line-by-line AWK state machine for 100% portable metadata & dependency extraction
     pkg_meta_tmp="/tmp/entware_doctor_pkgs_$$.tmp"
 
     awk '
-    /^Package: / {
+    /^Package:/ {
         if (pkg != "") {
             print pkg "|" sec "|" size "|" deps;
         }
-        pkg = substr($0, 10);
+        pkg = $0;
+        sub(/^Package:[ \t]*/, "", pkg);
         gsub(/[ \t\r\n]/, "", pkg);
         sec = "";
         size = 0;
         deps = "";
         next;
     }
-    /^Section: / {
-        sec = substr($0, 10);
+    /^Section:/ {
+        sec = $0;
+        sub(/^Section:[ \t]*/, "", sec);
         gsub(/[ \t\r\n]/, "", sec);
         next;
     }
-    /^Installed-Size: / {
-        size = substr($0, 17);
-        gsub(/[ \t\r\n]/, "", size);
+    /^Installed-Size:/ {
+        sline = $0;
+        sub(/^Installed-Size:[ \t]*/, "", sline);
+        gsub(/[^0-9]/, "", sline);
+        if (sline != "") size = sline + 0;
         next;
     }
-    /^Depends: / {
-        dline = substr($0, 10);
-        split(dline, raw_deps, ",");
-        clean_deps = "";
-        for (d in raw_deps) {
-            dep = raw_deps[d];
-            gsub(/\([^)]*\)/, "", dep);
-            gsub(/[ \t\r\n]/, "", dep);
-            if (dep != "") {
-                clean_deps = clean_deps " " dep;
-            }
+    /^Size:/ {
+        if (size == 0 || size == "") {
+            sline = $0;
+            sub(/^Size:[ \t]*/, "", sline);
+            gsub(/[^0-9]/, "", sline);
+            if (sline != "") size = sline + 0;
         }
-        deps = clean_deps;
+        next;
+    }
+    /^Depends:/ {
+        dline = $0;
+        sub(/^Depends:[ \t]*/, "", dline);
+        gsub(/\([^)]*\)/, "", dline);
+        gsub(/,/, " ", dline);
+        deps = deps " " dline;
         next;
     }
     END {
@@ -353,14 +359,12 @@ check_orphaned_packages() {
     }
     ' "${OPKG_STATUS}" > "${pkg_meta_tmp}"
 
-    # 2. Build master list of required dependencies
-    all_needed_deps="$(awk -F'|' '{print $4}' "${pkg_meta_tmp}" | tr ' ' '\n' | grep -v '^$' | sort -u)"
+    # 2. Build master list of all required dependency package names
+    all_needed_deps="$(awk -F'|' '{print $4}' "${pkg_meta_tmp}" | tr ' ' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' | sort -u)"
 
-    # 3. Collect active dynamic libraries linked by executables in /opt/bin and /opt/sbin
-    used_so_files=""
-    if command -v ldd >/dev/null 2>&1; then
-        used_so_files="$(ldd /opt/bin/* /opt/sbin/* 2>/dev/null | awk '{print $1}' | sed 's/.*lib/lib/' | sort -u || true)"
-    fi
+    # 3. Discover all dynamic shared libraries (.so) actively referenced by all binaries in /opt
+    # This works natively with BusyBox grep without needing ldd or readelf!
+    used_so_files="$(grep -ahoE 'lib[a-zA-Z0-9_\.\+-]+\.so(\.[0-9]+)*' /opt/bin /opt/sbin /opt/lib 2>/dev/null | sort -u || true)"
 
     orphan_candidates=""
     reclaimed_bytes=0
@@ -369,7 +373,7 @@ check_orphaned_packages() {
     while IFS='|' read -r pkg_name pkg_sec pkg_size _pkg_deps; do
         [ -n "${pkg_name}" ] || continue
 
-        # Skip protected packages
+        # Skip protected core packages
         case " ${PROTECTED_PKGS} " in
             *" ${pkg_name} "*) continue ;;
         esac
@@ -378,7 +382,7 @@ check_orphaned_packages() {
         pkg_list_file="/opt/lib/opkg/info/${pkg_name}.list"
         [ -f "${pkg_list_file}" ] || pkg_list_file="/opt/var/lib/opkg/info/${pkg_name}.list"
 
-        # Check if the package installs any executable command or init script
+        # Check if the package installs any executable command or init service
         if [ -f "${pkg_list_file}" ]; then
             if grep -qE "(^|/)(bin|sbin|etc/init\.d)/" "${pkg_list_file}" 2>/dev/null; then
                 continue
@@ -399,7 +403,7 @@ check_orphaned_packages() {
             lib*|python3-*|perl5-*|lua-*|*-data|*-common) is_lib_pkg=1 ;;
         esac
 
-        # Standalone application -> skip
+        # Standalone user application -> skip
         [ "${is_lib_pkg}" -eq 0 ] && continue
 
         # Check if required as a dependency by another installed package
@@ -407,9 +411,16 @@ check_orphaned_packages() {
             continue
         fi
 
-        # Check if dynamically linked by active binaries in /opt/bin or /opt/sbin
+        # Check if package name itself matches a referenced library prefix (e.g. libcurl -> libcurl.so)
+        if [ -n "${used_so_files}" ]; then
+            if echo "${used_so_files}" | grep -qE "^${pkg_name}(\.so|-|\.)"; then
+                continue
+            fi
+        fi
+
+        # Check if any .so file provided by this package is actively referenced by executables
         if [ -n "${used_so_files}" ] && [ -f "${pkg_list_file}" ]; then
-            pkg_so_names="$(grep '\.so' "${pkg_list_file}" 2>/dev/null | awk -F'/' '{print $NF}' | sed 's/\.so.*/.so/' || true)"
+            pkg_so_names="$(grep '\.so' "${pkg_list_file}" 2>/dev/null | awk -F'/' '{print $NF}' | sed 's/\.so.*/.so/' | sort -u || true)"
             is_so_used=0
             for so_name in ${pkg_so_names}; do
                 if echo "${used_so_files}" | grep -q "${so_name}"; then
@@ -432,12 +443,16 @@ check_orphaned_packages() {
 
     if [ -n "${orphan_candidates}" ]; then
         orphan_count="$(echo "${orphan_candidates}" | wc -w | tr -d ' ')"
-        reclaimed_kb=$((reclaimed_bytes / 1024))
+        reclaimed_kb=$(( (reclaimed_bytes + 1023) / 1024 ))
         log_warn "Detected ${orphan_count} true orphaned library package(s):"
         for opkg_name in ${orphan_candidates}; do
             printf "        - %b%s%b\n" "${C_YELLOW}" "${opkg_name}" "${C_RESET}"
         done
-        printf "    %bRecoverable Space: ~%d KB (%d MB)%b\n" "${C_CYAN}" "${reclaimed_kb}" "$((reclaimed_kb / 1024))" "${C_RESET}"
+        if [ "${reclaimed_kb}" -ge 1024 ]; then
+            printf "    %bRecoverable Space: ~%d KB (~%d MB)%b\n" "${C_CYAN}" "${reclaimed_kb}" "$((reclaimed_kb / 1024))" "${C_RESET}"
+        else
+            printf "    %bRecoverable Space: ~%d KB%b\n" "${C_CYAN}" "${reclaimed_kb}" "${C_RESET}"
+        fi
 
         if [ "${FLAG_FIX}" -eq 1 ] || [ "${FLAG_ASSUME_YES}" -eq 1 ]; then
             if prompt_confirm "Would you like to remove these ${orphan_count} orphaned library packages?"; then
